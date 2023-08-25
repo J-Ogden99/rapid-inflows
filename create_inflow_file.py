@@ -11,8 +11,8 @@ import pandas as pd
 import xarray as xr
 
 logging.basicConfig(level=logging.INFO,
-                    stream=sys.stdout,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    stream=sys.stdout, )
 
 
 def create_inflow_file_for_all_inputs(lsm_files: str or list,
@@ -29,13 +29,13 @@ def create_inflow_file_for_all_inputs(lsm_files: str or list,
     lsm_files: str or list
         Path to the LSM files or list of LSM files or a glob pattern string
     inputs_root_dir: str
-        Path to the root directory for input directories
+        Path to the root vpudir for input directories
     inflows_root_dir: str
-        Path to the root directory for inflow directories
+        Path to the root vpudir for inflow directories
     weight_table: str, list
-        name of the weight table to use from each input directory
+        name of the weight table to use from each input vpudir
     comid_lat_lon_z: str
-        name of the comid_lat_lon_z csv file to use from each directory
+        name of the comid_lat_lon_z csv file to use from each vpudir
     """
     # open all the ncs and select only the area within the weight table
     logging.info('Opening LSM multifile dataset')
@@ -67,11 +67,18 @@ def create_inflow_file_for_all_inputs(lsm_files: str or list,
     logging.info('Reading Time Values')
     datetime_array = lsm_dataset['time'].values.flatten()
 
-    for input_dir in [d for d in glob.glob(os.path.join(inputs_root_dir, '*')) if os.path.isdir(d)]:
+    for input_dir in sorted([d for d in glob.glob(os.path.join(inputs_root_dir, '*')) if os.path.isdir(d)]):
         logging.info(f'Processing {input_dir}')
         vpu_name = os.path.basename(input_dir)
         wt_path = os.path.join(input_dir, weight_table)
         comid_path = os.path.join(input_dir, comid_lat_lon_z)
+        os.makedirs(os.path.join(inflows_root_dir, vpu_name), exist_ok=True)
+        start_date = datetime.datetime.utcfromtimestamp(datetime_array[0].astype(float) / 1e9).strftime('%Y%m%d')
+        end_date = datetime.datetime.utcfromtimestamp(datetime_array[-1].astype(float) / 1e9).strftime('%Y%m%d')
+        inflow_file_path = os.path.join(inflows_root_dir, vpu_name, f'm3_{vpu_name}_{start_date}_{end_date}.nc')
+
+        if os.path.exists(inflow_file_path):
+            continue
 
         # Ensure that every input file exists
         if not os.path.exists(wt_path):
@@ -84,25 +91,13 @@ def create_inflow_file_for_all_inputs(lsm_files: str or list,
         weight_df = pd.read_csv(wt_path)
         comid_df = pd.read_csv(comid_path)
 
-        min_lon_idx = weight_df['lon_index'].min().astype(int)
-        max_lon_idx = weight_df['lon_index'].max().astype(int)
-        min_lat_idx = weight_df['lat_index'].min().astype(int)
-        max_lat_idx = weight_df['lat_index'].max().astype(int)
-
-        if min_lon_idx > max_lon_idx:
-            min_lon_idx, max_lon_idx = max_lon_idx, min_lon_idx
-        if min_lat_idx > max_lat_idx:
-            min_lat_idx, max_lat_idx = max_lat_idx, min_lat_idx
-
-        # for readability, select certain cols from the weight table
-        lat_indices = weight_df['lat_index'].values - min_lat_idx
-        lon_indices = weight_df['lon_index'].values - min_lon_idx
-
         logging.info('\tCreating inflow array')
         if lsm_dataset[runoff_variable].ndim == 3:
-            inflow_df = lsm_dataset[runoff_variable].values[:, lat_indices, lon_indices]
+            inflow_df = lsm_dataset[runoff_variable].values[:, weight_df['lat_index'].values,
+                        weight_df['lon_index'].values]
         elif lsm_dataset[runoff_variable].ndim == 4:
-            inflow_df = lsm_dataset[runoff_variable].values[:, :, lat_indices, lon_indices]
+            inflow_df = lsm_dataset[runoff_variable].values[:, :, weight_df['lat_index'].values,
+                        weight_df['lon_index'].values]
             inflow_df = np.where(np.isnan(inflow_df[:, 0, :]), inflow_df[:, 1, :], inflow_df[:, 0, :]),
         else:
             raise ValueError(f"Unknown number of dimensions: {lsm_dataset.ndim}")
@@ -113,113 +108,104 @@ def create_inflow_file_for_all_inputs(lsm_files: str or list,
         # group columns by matching weight table rivid
         inflow_df = pd.DataFrame(inflow_df, columns=weight_df.iloc[:, 0].to_numpy(), index=datetime_array)
         inflow_df = inflow_df.groupby(by=weight_df.iloc[:, 0].to_numpy(), axis=1).sum()
-        # group dataframe by year month day values in index
-        # inflow_df = inflow_df.groupby(inflow_df.index.strftime('%Y%m%d')).sum()
-        # inflow_df.index = pd.to_datetime(inflow_df.index, format='%Y%m%d')
-        # datetime_array = inflow_df.index.to_numpy()
-        # get an array from the dataframe sorted by the rivid order in the comid_lat_lon_z csv
         inflow_df = inflow_df[comid_df.iloc[:, 0].to_numpy()]
 
         # Create output inflow netcdf data
         logging.info("\tWriting inflows to file")
-        os.makedirs(os.path.join(inflows_root_dir, vpu_name), exist_ok=True)
-        start_date = datetime.datetime.utcfromtimestamp(datetime_array[0].astype(float) / 1e9).strftime('%Y%m%d')
-        end_date = datetime.datetime.utcfromtimestamp(datetime_array[-1].astype(float) / 1e9).strftime('%Y%m%d')
-        inflow_file_path = os.path.join(inflows_root_dir, vpu_name, f'm3_{vpu_name}_{start_date}_{end_date}.nc')
 
-        with nc.Dataset(inflow_file_path, "w", format="NETCDF3_CLASSIC") as inflow_nc:
-            # create dimensions
-            inflow_nc.createDimension('time', inflow_df.shape[0])
-            inflow_nc.createDimension('rivid', comid_df.shape[0])
-            inflow_nc.createDimension('nv', 2)
+        try:
+            with nc.Dataset(inflow_file_path, "w", format="NETCDF3_CLASSIC") as ds:
+                # create dimensions
+                ds.createDimension('time', inflow_df.shape[0])
+                ds.createDimension('rivid', comid_df.shape[0])
+                ds.createDimension('nv', 2)
 
-            # m3_riv
-            m3_riv_var = inflow_nc.createVariable('m3_riv', 'f4', ('time', 'rivid'),
-                                                  fill_value=0, zlib=True, complevel=7)
-            m3_riv_var[:] = inflow_df.to_numpy()
-            m3_riv_var.long_name = 'accumulated inflow inflow volume in river reach boundaries'
-            m3_riv_var.units = 'm3'
-            m3_riv_var.coordinates = 'lon lat'
-            m3_riv_var.grid_mapping = 'crs'
-            m3_riv_var.cell_methods = "time: sum"
+                ds.createVariable('rivid', 'i4', ('rivid',))
+                ds.createVariable('time', 'i4', ('time',))
+                ds.createVariable('time_bnds', 'i4', ('time', 'nv',))
+                ds.createVariable('m3_riv', 'f4', ('time', 'rivid'), fill_value=0.0)
+                ds.createVariable('lon', 'f8', ('rivid',), fill_value=-9999.0)
+                ds.createVariable('lat', 'f8', ('rivid',), fill_value=-9999.0)
+                ds.createVariable('crs', 'i4')
 
-            # rivid
-            rivid_var = inflow_nc.createVariable('rivid', 'i4', ('rivid',),
-                                                 zlib=True, complevel=7)
-            rivid_var[:] = comid_df.iloc[:, 0].to_numpy()
-            rivid_var.long_name = 'unique identifier for each river reach'
-            rivid_var.units = '1'
-            rivid_var.cf_role = 'timeseries_id'
+                # rivid
+                ds['rivid'].long_name = 'unique identifier for each river reach'
+                ds['rivid'].units = '1'
+                ds['rivid'].cf_role = 'timeseries_id'
+                ds['rivid'][:] = comid_df.iloc[:, 0].astype(int).to_numpy()
 
-            # time
-            reference_time = datetime_array[0]
-            time_step = (datetime_array[1] - datetime_array[0]).astype('timedelta64[s]')
-            time_var = inflow_nc.createVariable('time', 'i4', ('time',),
-                                                zlib=True, complevel=7)
-            time_var[:] = (datetime_array - reference_time).astype('timedelta64[s]').astype(int)
-            time_var.long_name = 'time'
-            time_var.standard_name = 'time'
-            time_var.units = f'seconds since {reference_time.astype("datetime64[s]")}'  # Must be seconds
-            time_var.axis = 'T'
-            time_var.calendar = 'gregorian'
-            time_var.bounds = 'time_bnds'
+                # time
+                reference_time = datetime_array[0]
+                time_step = (datetime_array[1] - datetime_array[0]).astype('timedelta64[s]')
+                ds['time'].long_name = 'time'
+                ds['time'].standard_name = 'time'
+                ds['time'].units = f'seconds since {reference_time.astype("datetime64[s]")}'  # Must be seconds
+                ds['time'].axis = 'T'
+                ds['time'].calendar = 'gregorian'
+                ds['time'].bounds = 'time_bnds'
+                ds['time'][:] = (datetime_array - reference_time).astype('timedelta64[s]').astype(int)
 
-            # time_bnds
-            time_bnds = inflow_nc.createVariable('time_bnds', 'i4', ('time', 'nv',),
-                                                 zlib=True, complevel=7)
-            time_bnds_array = np.stack([datetime_array, datetime_array + time_step], axis=1)
-            time_bnds_array = (time_bnds_array - reference_time).astype('timedelta64[s]').astype(int)
-            time_bnds[:] = time_bnds_array
+                # time_bnds
+                time_bnds_array = np.stack([datetime_array, datetime_array + time_step], axis=1)
+                time_bnds_array = (time_bnds_array - reference_time).astype('timedelta64[s]').astype(int)
+                ds['time_bnds'][:] = time_bnds_array
 
-            # longitude
-            lon_var = inflow_nc.createVariable('lon', 'f8', ('rivid',),
-                                               fill_value=-9999.0, zlib=True, complevel=7)
-            lon_var[:] = comid_df['lon'].values
-            lon_var.long_name = 'longitude of a point related to each river reach'
-            lon_var.standard_name = 'longitude'
-            lon_var.units = 'degrees_east'
-            lon_var.axis = 'X'
+                # m3_riv
+                ds['m3_riv'][:] = inflow_df.values
+                ds['m3_riv'].long_name = 'accumulated inflow volume in river reach boundaries'
+                ds['m3_riv'].units = 'm3'
+                ds['m3_riv'].coordinates = 'lon lat'
+                ds['m3_riv'].grid_mapping = 'crs'
+                ds['m3_riv'].cell_methods = "time: sum"
 
-            # latitude
-            lat_var = inflow_nc.createVariable('lat', 'f8', ('rivid',),
-                                               fill_value=-9999.0, zlib=True, complevel=7)
-            lat_var[:] = comid_df['lat'].values
-            lat_var.long_name = 'latitude of a point related to each river reach'
-            lat_var.standard_name = 'latitude'
-            lat_var.units = 'degrees_north'
-            lat_var.axis = 'Y'
+                # longitude
+                ds['lon'].long_name = 'longitude of a point related to each river reach'
+                ds['lon'].standard_name = 'longitude'
+                ds['lon'].units = 'degrees_east'
+                ds['lon'].axis = 'X'
+                ds['lon'][:] = comid_df['lon'].values
 
-            # crs
-            crs_var = inflow_nc.createVariable('crs', 'i4',
-                                               zlib=True, complevel=7)
-            crs_var.grid_mapping_name = 'latitude_longitude'
-            crs_var.epsg_code = 'EPSG:4326'  # WGS 84
-            crs_var.semi_major_axis = 6378137.0
-            crs_var.inverse_flattening = 298.257223563
+                # latitude
+                ds['lat'].long_name = 'latitude of a point related to each river reach'
+                ds['lat'].standard_name = 'latitude'
+                ds['lat'].units = 'degrees_north'
+                ds['lat'].axis = 'Y'
+                ds['lat'][:] = comid_df['lat'].values
 
-            # add global attributes
-            inflow_nc.Conventions = 'CF-1.6'
-            inflow_nc.history = 'date_created: {0}'.format(datetime.datetime.utcnow())
-            inflow_nc.featureType = 'timeSeries'
+                # crs
+                ds['crs'].grid_mapping_name = 'latitude_longitude'
+                ds['crs'].epsg_code = 'EPSG:4326'  # WGS 84
+                ds['crs'].semi_major_axis = 6378137.0
+                ds['crs'].inverse_flattening = 298.257223563
+
+                # add global attributes
+                ds.Conventions = 'CF-1.6'
+                ds.history = 'date_created: {0}'.format(datetime.datetime.utcnow())
+                ds.featureType = 'timeSeries'
+        except Exception as e:
+            logging.error(f"\tError writing inflow file: {e}")
+            if os.path.exists(inflow_file_path):
+                os.remove(inflow_file_path)
+            continue
 
     lsm_dataset.close()
     return
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Create inflow file for LSM files and input directory.')
+    parser = argparse.ArgumentParser(description='Create inflow file for LSM files and input vpudir.')
 
     # Define the command-line argument
     parser.add_argument('--lsmfile', type=str, help='LSM file containing RO variable')
-    parser.add_argument('--inputsroot', type=str, help='Inputs directory')
-    parser.add_argument('--inflowsroot', type=str, help='Inflows directory')
+    parser.add_argument('--inputsroot', type=str, help='Inputs vpudir')
+    parser.add_argument('--inflowsroot', type=str, help='Inflows vpudir')
     args = parser.parse_args()
 
     # Access the parsed argument
     if not all([args.lsmfile, args.inputsroot, args.inflowsroot]):
         raise ValueError('Missing required arguments')
 
-    # Create the inflow file for each input directory with the given LSM file
+    # Create the inflow file for each input vpudir with the given LSM file
     create_inflow_file_for_all_inputs(args.lsmfile,
                                       args.inputsroot,
                                       args.inflowsroot,

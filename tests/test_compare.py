@@ -15,7 +15,7 @@ import netCDF4 as nc
 import sys
 import os
 
-# Add the project_root directory to the Python path
+# Add the project_root vpudir to the Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(project_root)
 
